@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from xgboost import XGBClassifier  # 改为导入XGBoost
+from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                              confusion_matrix, average_precision_score)
@@ -34,59 +34,72 @@ class DataPreparer:
         smote = SMOTE(random_state=self.random_state)
         X_res, y_res = smote.fit_resample(X_train, y_train)
 
-        # 第二次分割
+        # 第二次分割（将SMOTE后的数据分为训练子集和校准集）
         n = len(X_res)
         idx = np.random.RandomState(self.random_state).permutation(n)
         split_idx = n // 2
 
-        X_train, X_cal = X_res[idx[:split_idx]], X_res[idx[split_idx:]]
-        y_train, y_cal = y_res[idx[:split_idx]], y_res[idx[split_idx:]]
+        X_train_final, X_cal = X_res[idx[:split_idx]], X_res[idx[split_idx:]]
+        y_train_final, y_cal = y_res[idx[:split_idx]], y_res[idx[split_idx:]]
 
-        return X_train, y_train, X_cal, y_cal, X_test, y_test
+        return X_train_final, y_train_final, X_cal, y_cal, X_test, y_test
 
 
-# 2. 模型训练模块（改为XGBoost）
+# 2. 模型训练模块（修正：通过 set_params 动态设置 scale_pos_weight）
 class ModelTrainer:
     def __init__(self, n_estimators=100, random_state=42):
         self.random_state = random_state
-        # 使用XGBoost分类器
-        self.model = XGBClassifier(
+        self.base_model = XGBClassifier(
             n_estimators=n_estimators,
             random_state=random_state,
             use_label_encoder=False,
             eval_metric='logloss',
-            scale_pos_weight=self._calculate_scale_pos_weight,
             subsample=0.8,
             colsample_bytree=0.8,
             learning_rate=0.1,
-            max_depth=6
+            max_depth=6,
         )
 
-    def _calculate_scale_pos_weight(self, y):
-        # 计算正负样本比例用于处理不平衡数据
-        return sum(y == 0) / sum(y == 1)
+    def _get_scale_pos_weight(self, y):
+        """计算正负样本比例权重 = 负样本数 / 正样本数"""
+        n_neg = np.sum(y == 0)
+        n_pos = np.sum(y == 1)
+        return n_neg / n_pos if n_pos > 0 else 1.0
 
     def cross_validate(self, X, y, n_splits=5):
         kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
         metrics = []
         for train_idx, val_idx in kf.split(X, y):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
-            self.model.fit(X_train, y_train)
-            y_pred = self.model.predict(X_val)
-            y_proba = self.model.predict_proba(X_val)[:, 1]
+            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+
+            # 克隆基础模型
+            model = clone(self.base_model)
+            # 动态设置当前折叠的 scale_pos_weight
+            scale_pos = self._get_scale_pos_weight(y_train_fold)
+            model.set_params(scale_pos_weight=scale_pos)
+
+            model.fit(X_train_fold, y_train_fold)
+
+            y_pred = model.predict(X_val_fold)
+            y_proba = model.predict_proba(X_val_fold)[:, 1]
+
             metrics.append({
-                'accuracy': accuracy_score(y_val, y_pred),
-                'f1': f1_score(y_val, y_pred),
-                'roc_auc': roc_auc_score(y_val, y_proba),
-                'gmean': geometric_mean_score(y_val, y_pred),
-                'avg_precision': average_precision_score(y_val, y_proba)
+                'accuracy': accuracy_score(y_val_fold, y_pred),
+                'f1': f1_score(y_val_fold, y_pred),
+                'roc_auc': roc_auc_score(y_val_fold, y_proba),
+                'gmean': geometric_mean_score(y_val_fold, y_pred),
+                'avg_precision': average_precision_score(y_val_fold, y_proba)
             })
         return pd.DataFrame(metrics)
 
     def train_final_model(self, X_train, y_train):
-        self.model.fit(X_train, y_train)
-        return self.model
+        """训练最终模型（使用全部训练数据，并应用 scale_pos_weight）"""
+        model = clone(self.base_model)
+        scale_pos = self._get_scale_pos_weight(y_train)
+        model.set_params(scale_pos_weight=scale_pos)
+        model.fit(X_train, y_train)
+        return model
 
 
 # 3. 共形预测模块（保持不变）
@@ -126,7 +139,7 @@ class AdvancedConformalPredictor:
         plt.subplot(121)
         sns.histplot(cal_scores, kde=True, bins=20)
         plt.axvline(self.q_hat, color='r', linestyle='--',
-                    label=f'Critical value (α=0.05)')
+                    label=f'Critical value (α={self.alpha})')
         plt.title("Nonconformity Scores Distribution")
         plt.xlabel("1 - P(y_true)")
         plt.legend()
@@ -154,7 +167,7 @@ class ResultVisualizer:
     def plot_metrics(self, metrics_df, filename="cv_metrics.png"):
         plt.figure(figsize=(10, 6))
         sns.boxplot(data=metrics_df, orient='h')
-        plt.title('Cross-Validation Metrics Distribution')
+        plt.title('Cross-Validation Metrics Distribution (XGBoost)')
         plt.tight_layout()
         plt.savefig(os.path.join(self.save_dir, filename))
         plt.close()
@@ -173,7 +186,7 @@ class ResultVisualizer:
 
         plt.xlabel('Recall / True Positive Rate', fontsize=12)
         plt.ylabel('Precision / Positive Predictive Value', fontsize=12)
-        plt.title('ROC & Precision-Recall Curves (XGBoost_SCP)', fontsize=14)  # 修改标题
+        plt.title('ROC & Precision-Recall Curves (XGBoost_SCP)', fontsize=14)
         plt.grid(True, alpha=0.3)
         plt.legend(loc='lower right', fontsize=10)
         plt.xlim([0.0, 1.0])
@@ -204,7 +217,7 @@ class ResultVisualizer:
         ax2.plot(confidence_levels, avg_set_sizes, '--s', color=color, linewidth=2, label='Average Set Size')
         ax2.tick_params(axis='y', labelcolor=color)
 
-        plt.title('Coverage Rate vs. Prediction Set Size (XGBoost)')  # 修改标题
+        plt.title('Coverage Rate vs. Prediction Set Size (XGBoost)')
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
@@ -224,7 +237,7 @@ if __name__ == "__main__":
     # 数据准备
     try:
         X_train, y_train, X_cal, y_cal, X_test, y_test = preparer.load_and_split(
-            "COUNT_SIS_selected_features.csv"
+            r"D:\PythonProject\Project\1\Data\COUNT_SIS_selected_features.csv"
         )
         print(f"数据加载成功！训练集: {X_train.shape}, 校准集: {X_cal.shape}, 测试集: {X_test.shape}")
     except FileNotFoundError:
@@ -234,7 +247,7 @@ if __name__ == "__main__":
     # 模型训练与评估
     print("\n正在进行交叉验证...")
     cv_results = trainer.cross_validate(X_train, y_train)
-    print("交叉验证结果：")
+    print("交叉验证结果：") 
     print(cv_results.describe().loc[['mean', 'std']].T)
     visualizer.plot_metrics(cv_results)
 
